@@ -30,9 +30,9 @@
 
 extern crate libc;
 
-use std::io;
+use std::io::{self, Read};
 use std::mem;
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 #[cfg(unix)] #[path = "unix.rs"]
@@ -74,6 +74,66 @@ pub trait ChildExt {
 impl ChildExt for Child {
     fn wait_timeout(&mut self, dur: Duration) -> io::Result<Option<ExitStatus>> {
         imp::wait_timeout(self, dur).map(|m| m.map(From::from))
+    }
+}
+
+/// Extension methods for the standard `std::process::Command` type.
+pub trait CommandExt {
+
+    /// Simultaneously waits for the child to exit and collect all remaining
+    /// output on the stdout/stderr handles, timing out after the specified
+    /// duration in milliseconds have elapsed.
+    ///
+    /// This method is the same as `Command::wait_with_output`,
+    /// but with a timeout.
+    ///
+    /// The stdin handle to the child process, if any, will be closed
+    /// before waiting. This helps avoid deadlock: it ensures that the
+    /// child does not block waiting for input from the parent, while
+    /// the parent waits for the child to exit.
+    fn wait_with_output(&mut self, timeout: Duration) -> io::Result<Output>;
+}
+
+impl CommandExt for Command {
+
+    fn wait_with_output(&mut self, timeout: Duration) -> io::Result<Output> {
+        self.stdin(Stdio::null());
+        self.stdout(Stdio::piped());
+        self.stderr(Stdio::piped());
+
+        let mut child = try!(self.spawn());
+
+        match try!(child.wait_timeout(timeout)) {
+            Some(status) => {
+                let mut res = Output {
+                    status: status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                };
+
+                if let Some(mut io) = child.stdout {
+                    try!(io.read_to_end(&mut res.stdout));
+                }
+                if let Some(mut io) = child.stderr {
+                    try!(io.read_to_end(&mut res.stderr));
+                }
+
+                Ok(res)
+            },
+            // Child hasn't exited yet, kill him!
+            None => {
+                // Ignore error, maybe child already died or someone else
+                // killed him, that's fine.
+                if child.kill().is_ok() {
+                    try!(child.wait());
+                }
+
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Command timed out, the process has been killed"
+                ))
+            },
+        }
     }
 }
 
